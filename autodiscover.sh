@@ -283,6 +283,15 @@ detect_nodes() {
         return 0
     fi
 
+    echo "Auto-detecting nodes..."
+
+    # Get the list of active IB network interfaces for filtering
+    INTERFACES=($(ibdev2netdev | awk '/Up\)/ {print $5}' | tr -d '()'))
+    if [ ${#INTERFACES[@]} -eq 0 ]; then
+        echo "Error: No active interfaces found via ibdev2netdev."
+        return 1
+    fi
+
     echo "Auto-detecting nodes on $CIDR (checking for NVIDIA GB10)..."
 
     local temp_file
@@ -291,19 +300,88 @@ detect_nodes() {
     _scan_subnet_for_gb10 "$CIDR" "$LOCAL_IP" "$temp_file"
 
     PEER_NODES=()
-    local detected_ips=("$LOCAL_IP")
-    if [[ -f "$temp_file" ]]; then
-        while read -r ip; do
-            PEER_NODES+=("$ip")
-            detected_ips+=("$ip")
-            echo "  Found GB10 peer: $ip"
-        done < <(sort "$temp_file")
-        rm -f "$temp_file"
+
+    # Try avahi-browse first (fast mDNS discovery), fall back to netcat scan
+    if command -v avahi-browse &> /dev/null; then
+        echo "  Discovering peers via mDNS (avahi-browse)..."
+
+        TEMP_FILE=$(mktemp)
+        TEMP_SORTED=$(mktemp)
+        trap 'rm -f "$TEMP_FILE" "$TEMP_SORTED"' EXIT
+
+        # avahi-browse: -p parseable, -r resolve, -t terminate when done
+        avahi_output=$(avahi-browse -p -r -f -t _ssh._tcp 2>/dev/null)
+
+        # Filter for our IB interfaces only
+        for interface in "${INTERFACES[@]}"; do
+            echo "$avahi_output" | grep "$interface" >> "$TEMP_FILE" 2>/dev/null || true
+        done
+
+        # Extract IPv4 addresses from resolved entries
+        grep "^=" "$TEMP_FILE" 2>/dev/null | grep "IPv4" | while IFS=';' read -r prefix interface protocol hostname_service description local fqdn ip_address port rest; do
+            clean_ip=$(echo "$ip_address" | sed 's/;.*$//')
+            if [[ $clean_ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+                echo "$clean_ip" >> "$TEMP_SORTED"
+            fi
+        done
+
+        # Deduplicate and collect results
+        if [[ -s "$TEMP_SORTED" ]]; then
+            while read -r ip; do
+                if [[ "$ip" != "$LOCAL_IP" ]]; then
+                    DETECTED_IPS+=("$ip")
+                    PEER_NODES+=("$ip")
+                    echo "  Found peer: $ip"
+                fi
+            done < <(sort -u "$TEMP_SORTED")
+        fi
+
+        rm -f "$TEMP_FILE" "$TEMP_SORTED"
+        trap - EXIT
+    else
+        # Fallback: scan subnet with netcat (slower)
+        echo "  avahi-browse not found, falling back to network scan..."
+
+        if ! command -v nc &> /dev/null; then
+            echo "Error: Neither avahi-browse nor nc found. Install avahi-utils or netcat."
+            return 1
+        fi
+        if ! command -v python3 &> /dev/null; then
+            echo "Error: python3 not found. Please install python3."
+            return 1
+        fi
+
+        echo "  Scanning for SSH peers on $CIDR..."
+
+        ALL_IPS=$(python3 -c "import ipaddress, sys; [print(ip) for ip in ipaddress.ip_network(sys.argv[1], strict=False).hosts()]" "$CIDR")
+
+        TEMP_IPS_FILE=$(mktemp)
+
+        for ip in $ALL_IPS; do
+            if [[ "$ip" == "$LOCAL_IP" ]]; then continue; fi
+            (
+                if nc -z -w 1 "$ip" 22 &>/dev/null; then
+                    echo "$ip" >> "$TEMP_IPS_FILE"
+                fi
+            ) &
+        done
+
+        wait
+
+        if [[ -f "$TEMP_IPS_FILE" ]]; then
+            while read -r ip; do
+                 DETECTED_IPS+=("$ip")
+                 PEER_NODES+=("$ip")
+                 echo "  Found peer: $ip"
+            done < "$TEMP_IPS_FILE"
+            rm -f "$TEMP_IPS_FILE"
+        fi
     fi
 
-    # Sort and set NODES_ARG
-    IFS=$'\n' SORTED_IPS=($(sort <<<"${detected_ips[*]}"))
+    # Sort IPs
+    IFS=$'\n' SORTED_IPS=($(sort <<<"${DETECTED_IPS[*]}"))
     unset IFS
+
     NODES_ARG=$(IFS=,; echo "${SORTED_IPS[*]}")
     echo "  Cluster Nodes: $NODES_ARG"
 }
