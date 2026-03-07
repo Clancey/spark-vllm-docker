@@ -16,10 +16,11 @@ container: vllm-node-tf5
 build_args:
   - --tf5
 
-# Mod required to fix ROPE syntax error
+# Mods: fix ROPE syntax error + fix MoE gate weight loading
 mods:
   - mods/fix-qwen3.5-autoround
   - mods/fix-qwen3.5-chat-template
+  - mods/fix-qwen3.5-moe-gate
 
 # Default settings (can be overridden via CLI)
 defaults:
